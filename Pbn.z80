@@ -1,0 +1,724 @@
+;*********************************************************
+;*
+;* Paint by Numbers
+;* Start Date: 14 October 1999
+;* Author: Marshall Ward
+;*
+;* This was a game which I believe is Japanese in origin.
+;* Joseph Lafiosca created a Javascript-based
+;* version for webpages, which prompted this version.
+;*
+;* Actually, I realized I'm not very creative and was
+;* desperate for an idea. Thus, I took what I could find.
+;*
+;* While not the most efficiently written, it may get done
+;* in a reasonable amount of time.
+;*
+;* Updates:
+;* Button reading has improved superbly!
+;* GBC support added!
+;*
+;* Don't know the legalities, but this source is as much
+;* [Copyright 1999, Marshall Ward]
+;* as legally possible.
+;*
+;*********************************************************
+
+INCLUDE "GB4REAL.INC"
+INCLUDE "MEMORY1.ASM"
+INCLUDE "TITLE.INC"
+INCLUDE	"TYPESET.INC"
+INCLUDE "BOARD.INC"
+INCLUDE "KEYPAD.ASM"
+
+;Variables
+
+SECTION "Main Mem", BSS[$C000]
+
+SpriteRAM:	DS	160		;Sprite RAM
+
+ResetFlag:	DS	1		;Was start pressed? 0 - no, 1 - yes
+HiLoc:		DS	1		;High byte of cursor location
+LoLoc:		DS	1		;Low byte of cursor location
+BlinkCtr:	DS	1		;Blink Counter, controls blink rate
+GradientFlag:	DS	1		;\-Blink Gradient: 0 -increase color
+					;/		   1 -decrease color
+					;	     (actually, any non-zero)
+;*********
+;* Main
+;*********
+
+SECTION "Start Program",HOME
+
+LdSpr: MACRO
+;* Setup one sprite at address hl
+	ld a, \1
+	ld [hl+], a
+	ld a, \2
+	ld [hl+], a
+	ld a, \3
+	ld [hl+], a
+	ld a, \4
+	ld [hl+], a
+ENDM
+
+;* Header file requires initial label be "Main::"
+
+Main::
+	;Init GB4Real
+	call	CleanUp
+	SetupSpriteHandler SpriteRAM, AUTO
+
+	;Init video settings
+	ld	a, %11000011
+	ldh	[$40], a
+
+	;OBP0 palette for Regular GB blinking
+	ld	a, %11001100
+	ldh	[$48], a
+
+Reset:
+	;Don't reset unless start is pushed
+	ld	a, 0
+	ld	[ResetFlag], a
+
+	;Remove Stray Sprite
+	ld	hl, SpriteRAM
+	vld	[hl], 0
+	inc	hl
+	vld	[hl], 0
+
+	;Remove Garbage Patterns
+	call	ClearPattern
+
+	;Init title
+	call	InitTitle
+
+	;Clear pattern, to lessen the flickering garbage
+	call	ClearPattern
+
+	;Draw the PBN board
+	call	DrawBoard
+
+	;Set up the Crosshair Cursor
+	call	InitCursor
+
+	;Init Blink Variables
+	ld	a, $F0
+	ld	[BlinkCtr], a
+
+;	ld	a, 0
+;	ld	[GradientFlag], a
+
+	;***************
+	;***Main Loop***
+	;***************
+ML:
+	;*******************
+	;* Blink Subroutine
+	
+	call	QDelay
+
+	ld	hl, BlinkCtr
+	dec	[hl]
+	jr	nz, noBlink
+
+	;First, DMG Blink
+	ldh	a, [$48]
+	rlc	a
+	rlc	a
+	ldh	[$48], a	
+
+	;Next, CGB Blink
+
+	;Flip color in hi byte
+	lcd_WaitVRAM
+	ld	a, %10000111
+	ldh	[$6A], a
+
+	lcd_WaitVRAM
+	ldh	a, [$6B]
+	cpl
+	ldh	[$6B], a
+
+	;Flip lo byte (Dont need to set OCPS)
+	lcd_WaitVRAM
+	ldh	a, [$6B]
+	cpl
+	ldh	[$6B], a
+
+	;Reset Counter
+	ld	a, $E0
+	ld	[BlinkCtr], a
+
+noBlink:
+
+	;******************
+	;* Button Reading
+
+	call	pad_Read
+	; A,B altered
+
+	cp	$80
+	call	z, GoDown
+
+	cp	$40
+	call	z, GoUp
+
+	cp	$20
+	call	z, GoLeft
+
+	cp	$10
+	call	z, GoRight
+
+	cp	$08
+	call	z, GoStart
+
+	cp	$04
+	call	z, GoSelect
+
+	cp	$02
+	call	z, GoA
+
+	cp	$01
+	call	z, GoB
+
+	;Check Reset Flag: NB -This is an Abort "structure"
+	ld	a, [ResetFlag]
+	cp	$1
+	jp	z, Reset
+
+	;Maybe I can use a jr instead, but why risk it!
+	jp	ML
+
+	;*******************
+	;***End Main Loop***
+	;*******************
+
+;******* Support Functions *********
+
+LoadTilePattern:
+;*************************************************
+;* loads a 4-color tile pattern.                 *
+;* in:                                           *
+;* hl = location of pattern data                 *
+;* de = Pattern location                         *
+;* first byte of hl = 8x8 tile count             *
+;*************************************************
+
+ 	push	hl
+	push	de
+	push	bc
+
+	ld	a,[hl+]
+	ld	c,a		; c = tile-count
+
+.L1:
+	ld	b,16		; 16 bytes per tile
+
+.L2:
+	ld	a,[hl+]
+	vld	[de], a
+	inc	de
+	dec	b
+	jr	nz, .L2
+
+	dec	c
+	jr	nz, .L1
+
+	pop	bc
+	pop	de
+	pop	hl
+  
+	ret
+
+
+LoadTitleMap:
+;*************************************************
+;* Loads data into title map.			 *
+;* Since layout's a but awkward, a separate	 *
+;* routine was written.				 *
+;* 						 *
+;* No input / No output				 *
+;*************************************************
+
+ 	push	hl
+	push	de
+	push	bc
+
+	;INIT - at third row, third tile
+	ld	hl, $9800 + (32*2 + 2)
+
+	;INIT - tile counter at tile 128
+	ld	b, 128
+
+	;INIT - 16 tiles per line are actually drawn (out of 20)
+	ld	c, 16
+
+.L1:
+	vld	[hl], b		; VRAM[hl] = b
+	inc	hl		; hl++
+
+	dec	c		; c--
+	jr	nz, .L2		; If c=0 do next 3 instructions
+
+	ld	c, 16		;	c==16
+	ld	de, 12+4	;\	hl+=16
+	add	hl, de		;/
+
+.L2:
+	inc	b		;b++
+	jr	nz, .L1		;If b!=0 load next pattern, else, end
+
+	pop	bc
+	pop	de
+	pop	hl
+
+	ret
+
+
+;************FUNCTIONS************
+
+;* InitTitle simply displays the title. When start is pressed,
+;* it returns to the main loop
+
+InitTitle:
+;* Displays title screen
+
+	;Set tile 0 as "blank"
+	ld	b, 16
+	ld	hl, $9000
+T0fill:
+	vld	[hl], $00
+	inc	hl
+	dec	b
+	jr	nz, T0fill
+
+	;Load typeset (1-62)
+	ld	hl, TTypeset
+	ld	de, $9010
+	call	LoadTilePattern
+
+	;Load title tiles (128-255)
+	ld	hl, TTitle
+	ld	de, $8800
+	call	LoadTilePattern
+
+	;Colorize BG palette 0
+	ld	a, %10000000		;\--Palette 0, increment BCPD after write
+	ldh	[$68], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $FF			;\--white (R31 G31 B31)
+	ldh	[$69], a		;|
+	ld	a, $7F			;|
+	ldh	[$69], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $00			;\--lt. blue (R0 G0 B31)
+	ldh	[$69], a		;|
+	ld	a, $7C			;|
+	ldh	[$69], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $00			;\--dk. blue (R0 G0 B15)
+	ldh	[$69], a		;|
+	ld	a, $3C			;|
+	ldh	[$69], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $00			;\--black (R0 G0 B0)
+	ldh	[$69], a		;|
+	ldh	[$69], a		;/
+
+	;Set title Map
+	call	LoadTitleMap
+
+	;Set text map
+	ld	hl, PressStart
+	ld	de, $9800 + (32*12 + 4) 
+	ld	bc, 12
+	call	mem_CopyVRAM
+	
+.waitforstart:
+	call	pad_Read
+	and	a,$08
+	jr	z,.waitforstart
+	
+	;No bouncing
+	call	QDelay
+
+.waitforrelease:
+	call	pad_Read
+	and	$08
+	jr	nz, .waitforrelease
+	
+	;No bouncing
+	call	QDelay
+
+	ret
+
+;********************************************************
+;* InitCursor loads the pattern and sets up the palette
+;********************************************************
+
+InitCursor:
+	;Oops! Bad me! This should have been in the shared pattern area
+	;(But then Pattern 00 wouldn't have been blank)
+	;Place crosshair pattern at OBJ Pattern 00
+
+	ld	b, 16		;Counter
+	ld	hl, $9220	;Location of crosshair pattern, $22 BG
+	ld	de, $8000	;Destination for crosshair, $00 OBJ
+
+.CursorPattern:
+	vld	a, [hl]
+	vld	[de], a
+
+	inc	hl
+	inc	de
+	dec	b
+	jr	nz, .CursorPattern
+
+	;Init the crosshair
+	ld	hl, SpriteRAM
+	LdSpr	$38,$38,$00,$00
+	ld	bc, $9800 + $A6
+	ld	a, b
+	ld	[HiLoc], a
+	ld	a, c
+	ld	[LoLoc], a
+
+	;Colorize OBJ palette 0
+	ld	a, %10000000		;\--Palette 0, increment BCPD after write
+	ldh	[$6A], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $FF			;\--white (R31 G31 B31)
+	ldh	[$6B], a		;|
+	ld	a, $7F			;|
+	ldh	[$6B], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $00			;\--lt. blue (R0 G0 B31)
+	ldh	[$6B], a		;|
+	ld	a, $7C			;|
+	ldh	[$6B], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $00			;\--dk. blue (R0 G0 B15)
+	ldh	[$6B], a		;|
+	ld	a, $3C			;|
+	ldh	[$6B], a		;/
+
+	lcd_WaitVRAM
+	ld	a, $15			;\--dk. red (R15 G0 B0)
+	ldh	[$6B], a		;|
+	ld	a, $00			;|
+	ldh	[$6B], a		;/
+
+	ret
+
+;****************************************
+;* DrawBoard draws the initial PBN board
+
+DrawBoard:
+	; Load the board tiles
+
+	ld	hl, TBoard
+	ld	de, $9000
+	call	LoadTilePattern
+
+	ld	hl, BoardMap
+	ld	de, $9800 + (2 * 32)
+	ld	bc, 13 * 32
+	call	mem_CopyVRAM
+	ret
+
+;**********************************************
+;* ClearPattern frees up the Background Map
+;* Its main function is to prevent flickering
+
+ClearPattern:
+
+	ld	b, $04
+	ld	hl, $9800
+.CPOutLoop:
+	ld	a, $FF
+
+.CPInLoop:
+	push	af
+	ld	a, $00
+	vld	[hl], a
+	inc	hl
+	pop	af
+
+	dec	a
+	jr	nz, .CPInLoop
+
+	dec	b
+	jr	nz, .CPOutLoop
+
+	ret
+
+
+;*******************************************
+;* Delay: MDelay: QDelay:
+;* longest ---> shortest
+;* These do nothing (productive) for so
+;* many cycles. 
+
+Delay:
+; Does nothing for ???? cycles
+	push	bc
+
+	ld c, $A0
+.D1
+	ld b, $FF
+.D2
+	dec b
+	jr nz, .D2
+	dec c
+	jr nz, .D1
+
+	pop	bc
+
+	ret
+
+MDelay:
+;Medium Delay
+	push	bc
+
+	ld c, $40
+.D1
+	ld b, $FF
+.D2
+	dec b
+	jr nz, .D2
+	dec c
+	jr nz, .D1
+
+	pop	bc
+
+	ret
+
+QDelay:
+;Quick Delay
+	push	bc
+	ld	b, $80
+.QD:
+	dec	b
+	jp	nz, .QD
+
+	pop	bc
+	ret
+
+;**********
+;* Go[dir] - move the cursor, if not on border, or activate button
+;**********
+
+GoDown:
+	push	hl
+	push	bc
+	push	af
+
+	ld	a, [SpriteRAM]	
+	cp	$80
+	jr	z, noDown
+	add	a, 8
+	ld	[SpriteRAM], a
+	
+	ld	a, [HiLoc]
+	ld	h, a
+	ld	a, [LoLoc]
+	ld	l, a
+	ld	bc, $20
+	add	hl, bc
+	ld	a, h
+	ld	[HiLoc], a
+	ld	a, l
+	ld	[LoLoc], a	
+noDown:	
+	call	Delay
+
+	pop	af
+	pop	bc
+	pop	hl
+
+	ret
+
+;*****************
+
+GoUp:
+	push	hl
+	push	bc
+	push	af
+
+	ld	a, [SpriteRAM]
+	cp	$38
+	jr	z, noUp
+	sub	8
+	ld	[SpriteRAM], a
+
+	ld	a, [HiLoc]
+	ld	h, a
+	ld	a, [LoLoc]
+	ld	l, a
+	ld	bc, -32
+	add	hl, bc
+	ld	a, h
+	ld	[HiLoc], a
+	ld	a, l
+	ld	[LoLoc], a	
+noUp:
+	call	Delay
+
+	pop	af
+	pop	bc
+	pop	hl
+
+	ret
+
+;*****************
+
+GoRight:
+	push	af
+
+	ld	a, [SpriteRAM+1]
+	cp	$80
+	jr	z, noRight
+	add	a, 8
+	ld	[SpriteRAM+1], a
+	
+	ld	a, [LoLoc]
+	inc	a
+	ld	[LoLoc], a
+noRight:	
+	call	Delay
+
+	pop	af
+
+	ret
+
+;*****************
+
+GoLeft:
+	push	af
+
+	ld	a, [SpriteRAM+1]
+	cp	$38
+	jr	z, noLeft
+	sub	8
+	ld	[SpriteRAM+1], a
+	
+	ld	a, [LoLoc]
+	dec	a
+	ld	[LoLoc], a
+noLeft:	
+	call	Delay
+
+	pop	af
+
+	ret
+
+;*****************
+
+GoStart:
+	push	hl
+
+	;DISABLED - causes crashes in rare circumstances
+	;	  - Its pretty damn useless anyway
+
+	; Wait for rattling
+;	call	Delay
+
+;	call	pad_Read
+;	and	$08
+;	jr	nz, GoStart
+
+;	call	Delay
+
+;	ld	hl, ResetFlag
+;	ld	[hl], 1
+
+	pop	hl
+
+	ret
+
+;*****************
+
+GoSelect:
+	push	hl
+	push	af
+
+	ld	a, [HiLoc]
+	ld	h, a
+	ld	a, [LoLoc]
+	ld	l, a
+	ld	a, $05
+	vld	[hl], a
+	
+	pop	af
+	pop	hl
+
+	ret
+
+;*****************
+
+GoB:
+	push	hl
+	push	af
+
+	ld	a, [HiLoc]
+	ld	h, a
+	ld	a, [LoLoc]
+	ld	l, a
+	ld	a, $01
+	vld	[hl], a
+
+	pop	af
+	pop	hl
+
+	ret
+
+;*****************
+
+GoA:
+	push	hl
+	push	af
+
+	ld	a, [HiLoc]
+	ld	h, a
+	ld	a, [LoLoc]
+	ld	l, a
+	ld	a, $06
+	vld	[hl], a
+
+	pop	af
+	pop	hl
+
+	ret
+
+;***********
+;* ROM Data
+;***********
+
+PressStart:
+db $10,$12,$05,$13,$13,$00,$13,$14,$01,$12,$14
+
+BoardMap:
+db 0,0,0,$00,$00,$04,$02,$02,$02,$02,$02,$02,$02,$02,$02,$02,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$00,$00,$03,$03,$03,$09,$03,$03,$03,$03,$03,$03,$03,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$04,$02,$01,$07,$0A,$16,$1F,$16,$13,$13,$10,$0D,$10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$02,$0A,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$08,$07,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$02,$10,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$0B,$07,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$0E,$07,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$02,$1C,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$02,$1C,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$02,$19,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$02,$13,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+db 0,0,0,$03,$02,$0D,$05,$05,$05,$05,$05,$05,$05,$05,$05,$05,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+
+
